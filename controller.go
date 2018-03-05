@@ -1,15 +1,18 @@
-// This controller watches for all pods in a configured namespace and makes sure that they
-// all have a hard-coded set of labels. It will add them to existing pods, new pods,
-// and will ensure that they have the labels on every update
+// This is functionally identical to the simple hard-coded controller.
+// But doesn't use global variables for configuration
 
 package main // import "github.com/carsonoid/kube-crds-and-controllers/hard-coded-controller"
 
 import (
 	"encoding/json"
 	"flag"
+	"io/ioutil"
 	logging "log"
 	"os"
 	"path/filepath"
+
+	// Better yaml handling
+	"github.com/ghodss/yaml"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -27,57 +30,44 @@ var (
 	log = logging.New(os.Stdout, "", logging.Lshortfile)
 )
 
-// "hard-coded" default holders
-var labels map[string]string
-var targetNamespace string
-
-func main() {
-	log.SetOutput(os.Stdout)
-
-	var kubeconfig *string
-	kubeconfig = flag.String("kubeconfig", filepath.Join(os.Getenv("HOME"), ".kube", "config"), "(optional) absolute path to the kubeconfig file")
-	flag.Parse()
-
-	// use the current context in kubeconfig
-	config, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
-	if err != nil {
-		panic(err.Error())
-	}
-
-	// create the clientset
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		panic(err.Error())
-	}
-
-	// Namespace
-	targetNamespace = "default"
-
-	// initialize labels
-	labels = make(map[string]string)
-	labels["is-awesome"] = "true"
-	labels["is-not-awesome"] = "false"
-
-	runController(clientset)
+// PodLabelConfig holds the namespace to target and labels to be ensured
+type PodLabelConfig struct {
+	TargetNamespace string            `json:"targetNamespace"`
+	Labels          map[string]string `json:"labels"`
 }
 
-func runController(client *kubernetes.Clientset) {
+// PodLabelController with a config and client
+type PodLabelController struct {
+	client *kubernetes.Clientset
+	Config *PodLabelConfig
+}
+
+// NewPodLabelController takes a kubernetes clientset and configuration and returns a valid PodLabelController
+func NewPodLabelController(client *kubernetes.Clientset, config *PodLabelConfig) *PodLabelController {
+	return &PodLabelController{
+		client: client,
+		Config: config,
+	}
+}
+
+// Run starts the PodLabelController and blocks until killed
+func (plc *PodLabelController) Run() {
 	log.Print("Starting Controller")
 
-	restClient := client.CoreV1().RESTClient()
-	listwatch := cache.NewListWatchFromClient(restClient, "pods", targetNamespace, fields.Everything())
+	restClient := plc.client.CoreV1().RESTClient()
+	listwatch := cache.NewListWatchFromClient(restClient, "pods", plc.Config.TargetNamespace, fields.Everything())
 
 	_, controller := cache.NewInformer(listwatch, &corev1.Pod{}, 0,
 		cache.ResourceEventHandlerFuncs{
 			AddFunc: func(obj interface{}) {
 				log.Print("Pod Add Event")
-				if err := handlePod(obj.(*corev1.Pod), client); err != nil {
+				if err := plc.handlePod(obj.(*corev1.Pod)); err != nil {
 					log.Printf("Error handling pod: %s", err)
 				}
 			},
 			UpdateFunc: func(oldobj interface{}, newobj interface{}) {
 				log.Print("Pod Update Event")
-				if err := handlePod(newobj.(*corev1.Pod), client); err != nil {
+				if err := plc.handlePod(newobj.(*corev1.Pod)); err != nil {
 					log.Printf("Error handling pod: %s", err)
 				}
 			},
@@ -93,7 +83,7 @@ func runController(client *kubernetes.Clientset) {
 	<-stopChan
 }
 
-func handlePod(pod *corev1.Pod, client *kubernetes.Clientset) error {
+func (plc *PodLabelController) handlePod(pod *corev1.Pod) error {
 	o, err := runtime.NewScheme().DeepCopy(pod)
 	if err != nil {
 		return err
@@ -102,7 +92,7 @@ func handlePod(pod *corev1.Pod, client *kubernetes.Clientset) error {
 
 	// apply labels if needed
 	// if no changes then return
-	if !labelPod(newPod) {
+	if !plc.labelPod(newPod) {
 		return nil
 	}
 
@@ -121,7 +111,7 @@ func handlePod(pod *corev1.Pod, client *kubernetes.Clientset) error {
 		return err
 	}
 
-	_, err = client.CoreV1().Pods(pod.Namespace).Patch(pod.Name, types.StrategicMergePatchType, patchBytes)
+	_, err = plc.client.CoreV1().Pods(pod.Namespace).Patch(pod.Name, types.StrategicMergePatchType, patchBytes)
 	if err != nil {
 		return err
 	}
@@ -129,7 +119,7 @@ func handlePod(pod *corev1.Pod, client *kubernetes.Clientset) error {
 	return nil
 }
 
-func labelPod(pod *corev1.Pod) bool {
+func (plc *PodLabelController) labelPod(pod *corev1.Pod) bool {
 	changed := false
 	// make sure map is initialized
 	if len(pod.GetLabels()) == 0 {
@@ -137,7 +127,7 @@ func labelPod(pod *corev1.Pod) bool {
 	}
 
 	// check keys
-	for k, newVal := range labels {
+	for k, newVal := range plc.Config.Labels {
 		if curVal, ok := pod.GetLabels()[k]; ok && curVal == newVal {
 			//log.Printf("Pod %s already has label: %s=%s", pod.GetName(), k, newVal)
 		} else {
@@ -147,4 +137,53 @@ func labelPod(pod *corev1.Pod) bool {
 		}
 	}
 	return changed
+}
+
+func main() {
+	log.SetOutput(os.Stdout)
+
+	var kubeconfig *string
+	kubeconfig = flag.String("kubeconfig", filepath.Join(os.Getenv("HOME"), ".kube", "config"), "(optional) absolute path to the kubeconfig file")
+	var configPath *string
+	configPath = flag.String("config", "", "(optional) custom PodLabelConfig file")
+	flag.Parse()
+
+	// use the current context in kubeconfig
+	config, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
+	if err != nil {
+		panic(err.Error())
+	}
+
+	// create the clientset
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		panic(err.Error())
+	}
+
+	// Load default config or one from a file
+	var podlabelconfig *PodLabelConfig
+	if *configPath == "" {
+		podlabelconfig = &PodLabelConfig{
+			TargetNamespace: "default",
+			Labels: map[string]string{
+				"is-from-structured": "true",
+			},
+		}
+	} else {
+		y, err := ioutil.ReadFile(*configPath)
+		if err != nil {
+			log.Printf("Error reading config file: %v\n", err)
+			return
+		}
+		err = yaml.Unmarshal(y, &podlabelconfig)
+		if err != nil {
+			log.Printf("Error unmarshaling config yaml: %v\n", err)
+			return
+		}
+	}
+
+	// Run controller with hard-coded config
+	plc := NewPodLabelController(clientset, podlabelconfig)
+
+	plc.Run()
 }
