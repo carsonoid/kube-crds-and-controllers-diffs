@@ -1,5 +1,5 @@
-// This is functionally identical to the hard-coded controllers.
-// However it reads it's configuration from a configmap that is constantly reloaded as it is changed
+// This is functionally identical to the single-config configmap based controller
+// However it reads it's configmap style reads all the keys of the configmap into a map of configs
 
 package main // import "github.com/carsonoid/kube-crds-and-controllers/hard-coded-controller"
 
@@ -45,7 +45,7 @@ type PodLabelConfig struct {
 // PodLabelController with a config and client
 type PodLabelController struct {
 	client         *kubernetes.Clientset
-	Config         *PodLabelConfig
+	Configs        map[string]*PodLabelConfig
 	configLoadChan chan bool
 }
 
@@ -67,11 +67,11 @@ func (plc *PodLabelController) Run() {
 	// wait for load/reload signal before starting pod controller
 	<-plc.configLoadChan
 
-	// Watch for config reloads and then recreate and restart the controller so all existing pods
+	// Watch for config reloads and then restart the controller so all existing pods
 	// are re-evaluted with new config
 	for {
 		restClient := plc.client.CoreV1().RESTClient()
-		listwatch := cache.NewListWatchFromClient(restClient, "pods", plc.Config.TargetNamespace, fields.Everything())
+		listwatch := cache.NewListWatchFromClient(restClient, "pods", corev1.NamespaceAll, fields.Everything())
 
 		_, controller := cache.NewInformer(listwatch, &corev1.Pod{}, 0,
 			cache.ResourceEventHandlerFuncs{
@@ -146,14 +146,20 @@ func (plc *PodLabelController) labelPod(pod *corev1.Pod) bool {
 		pod.ObjectMeta.Labels = make(map[string]string)
 	}
 
-	// check keys
-	for k, newVal := range plc.Config.Labels {
-		if curVal, ok := pod.GetLabels()[k]; ok && curVal == newVal {
-			//log.Printf("Pod %s already has label: %s=%s", pod.GetName(), k, newVal)
-		} else {
-			log.Printf("Pod %s needs label: %s=%s", pod.GetName(), k, newVal)
-			pod.Labels[k] = newVal
-			changed = true
+	// Loop all configs
+	for _, c := range plc.Configs {
+		// only apply labels if namespace matches
+		if pod.GetNamespace() == c.TargetNamespace {
+			// check keys
+			for k, newVal := range c.Labels {
+				if curVal, ok := pod.GetLabels()[k]; ok && curVal == newVal {
+					//log.Printf("Pod %s already has label: %s=%s", pod.GetName(), k, newVal)
+				} else {
+					log.Printf("Pod %s needs label: %s=%s", pod.GetName(), k, newVal)
+					pod.Labels[k] = newVal
+					changed = true
+				}
+			}
 		}
 	}
 	return changed
@@ -194,22 +200,29 @@ func (plc *PodLabelController) WatchConfigMap() {
 func (plc *PodLabelController) loadConfigMap(cm *corev1.ConfigMap) error {
 	log.Print("Loading ConfigMap")
 
-	// New empty config struct
-	c := PodLabelConfig{}
+	// make a new map so deleted keys get removed
+	plc.Configs = make(map[string]*PodLabelConfig)
 
-	// Make sure the configmap has the key we expect
-	if confYaml, ok := cm.Data["podLabelConfig"]; ok {
+	// Load all config keys from the map as configurations
+	for k, v := range cm.Data {
+		// New empty config struct
+		c := PodLabelConfig{}
+
 		// Populate struct from value
-		if err := yaml.Unmarshal([]byte(confYaml), &c); err != nil {
+		if err := yaml.Unmarshal([]byte(v), &c); err != nil {
 			return err
 		}
-		// Update config pointer
-		plc.Config = &c
 
-		// Send Load/Reload signal
-		plc.configLoadChan <- true
+		// Update map with pointer to struct
+		plc.Configs[k] = &c
+
 	}
-	log.Printf("Loaded new config: %+v", *plc.Config)
+
+	log.Printf("Loaded %d new configs", len(plc.Configs))
+
+	// Send Load/Reload signal
+	plc.configLoadChan <- true
+
 	return nil
 }
 
