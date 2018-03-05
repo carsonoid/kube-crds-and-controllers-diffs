@@ -1,12 +1,11 @@
-// This is functionally identical to the simple hard-coded controller.
-// But doesn't use global variables for configuration
+// This is functionally identical to the hard-coded controllers.
+// However it reads it's configuration from a configmap that is constantly reloaded as it is changed
 
 package main // import "github.com/carsonoid/kube-crds-and-controllers/hard-coded-controller"
 
 import (
 	"encoding/json"
 	"flag"
-	"io/ioutil"
 	logging "log"
 	"os"
 	"path/filepath"
@@ -14,6 +13,7 @@ import (
 	// Better yaml handling
 	"github.com/ghodss/yaml"
 
+	// Kubernetes and client-go
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -30,6 +30,12 @@ var (
 	log = logging.New(os.Stdout, "", logging.Lshortfile)
 )
 
+// These could be from flags if desired
+const (
+	configNamespace string = "kube-system"
+	configName      string = "pod-labeler-config"
+)
+
 // PodLabelConfig holds the namespace to target and labels to be ensured
 type PodLabelConfig struct {
 	TargetNamespace string            `json:"targetNamespace"`
@@ -38,49 +44,63 @@ type PodLabelConfig struct {
 
 // PodLabelController with a config and client
 type PodLabelController struct {
-	client *kubernetes.Clientset
-	Config *PodLabelConfig
+	client         *kubernetes.Clientset
+	Config         *PodLabelConfig
+	configLoadChan chan bool
 }
 
 // NewPodLabelController takes a kubernetes clientset and configuration and returns a valid PodLabelController
-func NewPodLabelController(client *kubernetes.Clientset, config *PodLabelConfig) *PodLabelController {
+func NewPodLabelController(client *kubernetes.Clientset) *PodLabelController {
 	return &PodLabelController{
-		client: client,
-		Config: config,
+		client:         client,
+		configLoadChan: make(chan bool),
 	}
 }
 
 // Run starts the PodLabelController and blocks until killed
 func (plc *PodLabelController) Run() {
-	log.Print("Starting Controller")
+	// Start configmap watcher
+	go plc.WatchConfigMap()
 
-	restClient := plc.client.CoreV1().RESTClient()
-	listwatch := cache.NewListWatchFromClient(restClient, "pods", plc.Config.TargetNamespace, fields.Everything())
+	log.Print("Waiting for initial config load")
 
-	_, controller := cache.NewInformer(listwatch, &corev1.Pod{}, 0,
-		cache.ResourceEventHandlerFuncs{
-			AddFunc: func(obj interface{}) {
-				log.Print("Pod Add Event")
-				if err := plc.handlePod(obj.(*corev1.Pod)); err != nil {
-					log.Printf("Error handling pod: %s", err)
-				}
-			},
-			UpdateFunc: func(oldobj interface{}, newobj interface{}) {
-				log.Print("Pod Update Event")
-				if err := plc.handlePod(newobj.(*corev1.Pod)); err != nil {
-					log.Printf("Error handling pod: %s", err)
-				}
-			},
-			DeleteFunc: func(obj interface{}) {
-				log.Print("Pod Delete Event")
-				// nothing to do
-			},
-		},
-	)
+	// wait for load/reload signal before starting pod controller
+	<-plc.configLoadChan
 
-	stopChan := make(chan struct{})
-	go controller.Run(stopChan)
-	<-stopChan
+	// Watch for config reloads and then recreate and restart the controller so all existing pods
+	// are re-evaluted with new config
+	for {
+		restClient := plc.client.CoreV1().RESTClient()
+		listwatch := cache.NewListWatchFromClient(restClient, "pods", plc.Config.TargetNamespace, fields.Everything())
+
+		_, controller := cache.NewInformer(listwatch, &corev1.Pod{}, 0,
+			cache.ResourceEventHandlerFuncs{
+				AddFunc: func(obj interface{}) {
+					log.Print("Pod Add Event")
+					if err := plc.handlePod(obj.(*corev1.Pod)); err != nil {
+						log.Printf("Error handling pod: %s", err)
+					}
+				},
+				UpdateFunc: func(oldobj interface{}, newobj interface{}) {
+					log.Print("Pod Update Event")
+					if err := plc.handlePod(newobj.(*corev1.Pod)); err != nil {
+						log.Printf("Error handling pod: %s", err)
+					}
+				},
+				DeleteFunc: func(obj interface{}) {
+					log.Print("Pod Delete Event")
+					// nothing to do
+				},
+			},
+		)
+
+		log.Print("Starting Controller")
+		stopChan := make(chan struct{})
+		go controller.Run(stopChan)
+		<-plc.configLoadChan
+		log.Print("killing controller")
+		close(stopChan)
+	}
 }
 
 func (plc *PodLabelController) handlePod(pod *corev1.Pod) error {
@@ -139,13 +159,65 @@ func (plc *PodLabelController) labelPod(pod *corev1.Pod) bool {
 	return changed
 }
 
+func (plc *PodLabelController) WatchConfigMap() {
+	log.Print("Watching for ConfigMap")
+
+	restClient := plc.client.CoreV1().RESTClient()
+	listwatch := cache.NewListWatchFromClient(restClient, "configmaps", configNamespace, fields.OneTermEqualSelector("metadata.name", configName))
+
+	_, controller := cache.NewInformer(listwatch, &corev1.ConfigMap{}, 0,
+		cache.ResourceEventHandlerFuncs{
+			AddFunc: func(obj interface{}) {
+				log.Print("ConfigMap Add Event")
+				if err := plc.loadConfigMap(obj.(*corev1.ConfigMap)); err != nil {
+					log.Printf("Error loading config from configmap: %s", err)
+				}
+			},
+			UpdateFunc: func(oldobj interface{}, newobj interface{}) {
+				log.Print("ConfigMap Update Event")
+				if err := plc.loadConfigMap(newobj.(*corev1.ConfigMap)); err != nil {
+					log.Printf("Error loading config from configmap: %s", err)
+				}
+			},
+			DeleteFunc: func(obj interface{}) {
+				log.Print("ConfigMap Deleted - last known config will be retained")
+				// nothing to do
+			},
+		},
+	)
+
+	stopChan := make(chan struct{})
+	controller.Run(stopChan)
+	<-stopChan
+}
+
+func (plc *PodLabelController) loadConfigMap(cm *corev1.ConfigMap) error {
+	log.Print("Loading ConfigMap")
+
+	// New empty config struct
+	c := PodLabelConfig{}
+
+	// Make sure the configmap has the key we expect
+	if confYaml, ok := cm.Data["podLabelConfig"]; ok {
+		// Populate struct from value
+		if err := yaml.Unmarshal([]byte(confYaml), &c); err != nil {
+			return err
+		}
+		// Update config pointer
+		plc.Config = &c
+
+		// Send Load/Reload signal
+		plc.configLoadChan <- true
+	}
+	log.Printf("Loaded new config: %+v", *plc.Config)
+	return nil
+}
+
 func main() {
 	log.SetOutput(os.Stdout)
 
 	var kubeconfig *string
 	kubeconfig = flag.String("kubeconfig", filepath.Join(os.Getenv("HOME"), ".kube", "config"), "(optional) absolute path to the kubeconfig file")
-	var configPath *string
-	configPath = flag.String("config", "", "(optional) custom PodLabelConfig file")
 	flag.Parse()
 
 	// use the current context in kubeconfig
@@ -160,30 +232,9 @@ func main() {
 		panic(err.Error())
 	}
 
-	// Load default config or one from a file
-	var podlabelconfig *PodLabelConfig
-	if *configPath == "" {
-		podlabelconfig = &PodLabelConfig{
-			TargetNamespace: "default",
-			Labels: map[string]string{
-				"is-from-structured": "true",
-			},
-		}
-	} else {
-		y, err := ioutil.ReadFile(*configPath)
-		if err != nil {
-			log.Printf("Error reading config file: %v\n", err)
-			return
-		}
-		err = yaml.Unmarshal(y, &podlabelconfig)
-		if err != nil {
-			log.Printf("Error unmarshaling config yaml: %v\n", err)
-			return
-		}
-	}
+	// Create controller, passing only the kube client
+	plc := NewPodLabelController(clientset)
 
-	// Run controller with hard-coded config
-	plc := NewPodLabelController(clientset, podlabelconfig)
-
+	// Run controller
 	plc.Run()
 }
